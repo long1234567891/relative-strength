@@ -1,9 +1,15 @@
 name: Generate RS Ratings
 
+# 원본: Fred6725/relative-strength (Apache License 2.0)
+# 변경: 결과를 원작자 저장소/시드로 보내지 않고, 이 저장소의 history/cutoffs.csv 에 매일 커트라인 7개를 누적
+
 on:
   schedule:
-    - cron: '30 23 * * 1-5'
+    - cron: '30 23 * * 1-5'   # 평일 23:30 UTC (한국 시간 다음날 오전 8:30)
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   generate-rs:
@@ -11,8 +17,8 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      # ── 1. Checkout relative-strength ──────────────────────────────────────
-      - name: Checkout relative-strength repo
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       # ── 2. Python 3.11 ─────────────────────────────────────────────────────
@@ -28,72 +34,48 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Verify yfinance + curl_cffi
-        run: |
-          python -c "import yfinance; print('yfinance', yfinance.__version__)"
-          python -c "import curl_cffi; print('curl_cffi OK')"
-
-      # ── 4. Run RS calculation ───────────────────────────────────────────────
+      # ── 4. Run RS calculation (원작자 코드 그대로) ──────────────────────────
       - name: Run relative strength calculation
         run: python relative-strength.py true
 
-      # ── 5. Save ticker_info cache ───────────────────────────────────────────
-      - name: Save ticker_info cache
+      # ── 5. 커트라인 7개를 history/cutoffs.csv 에 누적 ───────────────────────
+      - name: Append cutoffs to history
+        run: |
+          python - <<'EOF'
+          import os, datetime as dt
+          from zoneinfo import ZoneInfo
+          vals = []
+          for line in open('output/RSRATING.csv'):
+              p = line.strip().split(',')
+              if len(p) < 5:
+                  continue
+              v = float(p[4])
+              if v != 0 and v not in vals:
+                  vals.append(v)
+          vals.sort(reverse=True)
+          if len(vals) != 7:
+              raise SystemExit(f'RSRATING.csv 에서 커트라인 7개를 못 찾음: {vals}')
+          now = dt.datetime.now(ZoneInfo('America/New_York'))
+          day = now.date() if now.hour >= 16 else now.date() - dt.timedelta(days=1)
+          while day.weekday() >= 5:
+              day -= dt.timedelta(days=1)
+          os.makedirs('history', exist_ok=True)
+          path = 'history/cutoffs.csv'
+          if not os.path.exists(path):
+              open(path, 'w').write('date,t99,t90,t70,t50,t30,t10,t1\n')
+          rows = open(path).read().splitlines()
+          header, body = rows[0], [r for r in rows[1:] if r and not r.startswith(day.isoformat())]
+          body.append(day.isoformat() + ',' + ','.join(str(round(v, 2)) for v in vals))
+          body.sort()
+          open(path, 'w').write('\n'.join([header] + body) + '\n')
+          print('기록:', body[-1])
+          EOF
+
+      # ── 6. 이 저장소에 커밋 ─────────────────────────────────────────────────
+      - name: Commit results
         run: |
           git config user.email "action@github.com"
           git config user.name "GitHub Action"
-          git add data_persist/ticker_info.json
-          git diff --staged --quiet || git commit -m "Update ticker_info cache $(date +'%Y-%m-%d')"
+          git add history/cutoffs.csv data_persist/ticker_info.json
+          git diff --staged --quiet || git commit -m "RS cutoffs $(TZ=America/New_York date +'%Y-%m-%d')"
           git push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # ── 6. Push CSVs to rs-log ──────────────────────────────────────────────
-      - name: Checkout rs-log repo
-        uses: actions/checkout@v4
-        with:
-          repository: Fred6725/rs-log
-          token: ${{ secrets.RS_LOG_TOKEN }}
-          path: rs-log
-
-      - name: Copy outputs to rs-log
-        run: |
-          cp output/rs_stocks.csv     rs-log/output/rs_stocks.csv
-          cp output/rs_stocks_1.csv   rs-log/output/rs_stocks_1.csv
-          cp output/rs_stocks_2.csv   rs-log/output/rs_stocks_2.csv
-          cp output/rs_industries.csv rs-log/output/rs_industries.csv
-          cp output/RSRATING.csv      rs-log/output/RSRATING.csv
-
-      - name: Commit and push to rs-log
-        working-directory: rs-log
-        run: |
-          git config user.email "action@github.com"
-          git config user.name "GitHub Action"
-          git add output/
-          git diff --staged --quiet || git commit -m "RS Ratings update $(date +'%Y-%m-%d')"
-          git push
-
-      # ── 7. Push RSRATING.csv to TradingView Pine Seeds repo ─────────────────
-      # This triggers check_data.yaml in seed_fred6725_rs_rating,
-      # which validates the data and creates a PR → upload_data.yaml → TradingView
-      - name: Checkout seed_fred6725_rs_rating repo
-        uses: actions/checkout@v4
-        with:
-          repository: Fred6725/seed_fred6725_rs_rating
-          token: ${{ secrets.RS_LOG_TOKEN }}
-          path: seed-repo
-
-      - name: Copy RSRATING.csv to seed repo data folder
-        run: |
-          cp output/RSRATING.csv seed-repo/data/RSRATING.csv
-
-      - name: Commit and push to seed_fred6725_rs_rating
-        working-directory: seed-repo
-        run: |
-          git config user.email "action@github.com"
-          git config user.name "GitHub Action"
-          git add data/RSRATING.csv
-          git diff --staged --quiet || git commit -m "RS Rating data update $(date +'%Y-%m-%d')"
-          git push
-        # This push triggers check_data.yaml in seed_fred6725_rs_rating
-        # which runs validation and creates a PR → upload_data.yaml sends to TradingView
